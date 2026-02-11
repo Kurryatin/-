@@ -1,0 +1,111 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESP32Servo.h>
+
+const unsigned char pins[] = {13, 12, 14, 27, 16}; 
+const char* net[] = {"Z Fold5 пользователя", "123123123", "10.222.202.180"};
+const String dev_id = "ESP_SCANNER_1";
+const String key = "123";
+
+Servo servos[2];
+WiFiUDP udp;
+enum State { IDLE, SCANNING, GOTO_TARGET };
+State currentState = IDLE;
+int scanStep = 0;
+unsigned long lastActionTime = 0;
+int currentX = 0, currentY = 0;
+String currentMode = "WAIT";
+
+String xor_(String data) {
+  String res = "";
+  for (int i = 0; i < data.length(); i++) res += (char)(data[i] ^ key[i % key.length()]);
+  return res;
+}
+
+void send_st(int x, int y, String mode) {
+  digitalWrite(pins[3], LOW); delayMicroseconds(2);
+  digitalWrite(pins[3], HIGH); delayMicroseconds(30);
+  digitalWrite(pins[3], LOW);
+  long dur = pulseIn(pins[4], HIGH, 30000);
+  int dist = (dur / 2) / 29.1;
+
+  String msg = dev_id + ":" + String(x) + "," + String(y) + "|" + mode + "|" + String(dist);
+  String enc = xor_(msg);
+  udp.beginPacket(net[2], 5005);
+  udp.write((const uint8_t*)enc.c_str(), enc.length());
+  udp.endPacket();
+}
+
+void move_inst(int x, int y) {
+  int appX = (x > currentX) ? 1 : (x < currentX ? -1 : 0);
+  int appY = (y > currentY) ? 1 : (y < currentY ? -1 : 0);
+  while(currentX != x || currentY != y) {
+    if(currentX != x) currentX += appX;
+    if(currentY != y) currentY += appY;
+
+    servos[0].write(90 + currentX);
+    servos[1].write(90 + currentY);
+    delay(40); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(net[0], net[1]);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  udp.begin(5005); 
+  servos[0].attach(pins[0]); 
+  servos[1].attach(pins[1]);
+  pinMode(pins[2], OUTPUT);
+  pinMode(pins[3], OUTPUT);
+  pinMode(pins[4], INPUT);
+  
+  move_inst(0, 0);
+  send_st(0, 0, "READY");
+  Serial.println("Connected! My IP:");
+  Serial.println(WiFi.localIP()); 
+}
+
+void handleScanning() {
+  unsigned long now = millis();
+  if (now - lastActionTime < 1000) return; 
+  digitalWrite(pins[2], HIGH); 
+  lastActionTime = now;
+  int tx = 0, ty = 0;
+
+  if (scanStep < 9) { currentMode = "V_SCAN"; tx = -40 + (scanStep * 10); ty = 0; } 
+  else if (scanStep < 18) { currentMode = "H_SCAN"; tx = 0; ty = -40 + ((scanStep - 9) * 10); } 
+  else if (scanStep < 27) { currentMode = "DIAG_1"; tx = ty = -40 + ((scanStep - 18) * 10); } 
+  else if (scanStep < 36) { currentMode = "DIAG_2"; tx = -40 + ((scanStep - 27) * 10); ty = -tx; } 
+  else {
+    digitalWrite(pins[2], LOW); move_inst(0, 0);
+    send_st(0, 0, "FINISHED"); currentState = IDLE; scanStep = 0; return;
+  }
+  move_inst(tx, ty);
+  send_st(tx, ty, currentMode);
+  scanStep++;
+}
+
+void loop() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char buf[255]; int len = udp.read(buf, 255); buf[len] = 0;
+    String raw_cmd = xor_(String(buf));
+    raw_cmd.trim(); 
+    if (raw_cmd == "START") {
+      send_st(0, 0, "ACK_START");
+      scanStep = 0; currentState = SCANNING;
+      lastActionTime = millis() - 1001; 
+    } 
+    else if (raw_cmd.indexOf(' ') != -1) {
+      int sp = raw_cmd.indexOf(' ');
+      int tx = raw_cmd.substring(0, sp).toInt();
+      int ty = raw_cmd.substring(sp + 1).toInt();
+      currentState = IDLE; move_inst(tx, ty);
+      digitalWrite(pins[2], HIGH); send_st(tx, ty, "ACK_GOTO"); 
+      delay(3000); digitalWrite(pins[2], LOW);
+      move_inst(0, 0); send_st(0, 0, "IDLE");
+    }
+  }
+  if (currentState == SCANNING) handleScanning();
+}
